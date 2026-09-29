@@ -292,7 +292,9 @@ func main() {
 		go func() {
 			defer wg.Done()
 			logCollector := runtime.NewCollector(&globalConfig, writer)
-			logCollector.Run(stop)
+			if err := logCollector.Run(stop); err != nil {
+				logrus.Fatalf("Log collector failed: %v", err)
+			}
 			logrus.Info("Log collector shutdown")
 		}()
 	}
