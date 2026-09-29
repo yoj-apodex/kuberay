@@ -1,8 +1,10 @@
 package logcollector
 
 import (
-	"bytes"
+	"context"
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -45,6 +48,10 @@ type RayLogHandler struct {
 	AdditionalEndpoints    []string
 	EndpointPollInterval   time.Duration
 	mu                     sync.RWMutex
+	prevProcessMu          sync.Mutex
+	DriverArchiveEnabled   bool
+	driverContext          context.Context
+	stopping               atomic.Bool
 }
 
 func (r *RayLogHandler) GetRayNodeName() string {
@@ -69,6 +76,18 @@ func (r *RayLogHandler) Run(stop <-chan struct{}) error {
 
 	// Initialize log file paths storage
 	r.logFilePaths = make(map[string]bool)
+	if err := r.validateDriverArchive(); err != nil {
+		return err
+	}
+	driverCtx, cancelDriver := context.WithCancel(context.Background())
+	defer cancelDriver()
+	r.driverContext = driverCtx
+	driverDone := make(chan struct{})
+	if r.DriverArchiveEnabled {
+		go r.runDriverArchive(stop, driverDone)
+	} else {
+		close(driverDone)
+	}
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -94,6 +113,12 @@ func (r *RayLogHandler) Run(stop <-chan struct{}) error {
 
 	<-stop
 	logrus.Info("Received stop signal, processing all logs...")
+	r.stopping.Store(true)
+	cancelDriver()
+	finalCtx, cancelFinal := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelFinal()
+	<-driverDone
+	r.flushAllDrivers(finalCtx)
 
 	// Endpoint data dies with the dashboard; log files stay on disk, so poll concurrently.
 	var wg sync.WaitGroup
@@ -119,6 +144,8 @@ func (r *RayLogHandler) Run(stop <-chan struct{}) error {
 // processSessionLatestLogs processes logs in the configured session_latest/logs directory
 // on shutdown, using the real session ID and node ID
 func (r *RayLogHandler) processSessionLatestLogs() {
+	r.prevProcessMu.Lock()
+	defer r.prevProcessMu.Unlock()
 	logrus.Info("Processing session_latest logs on shutdown...")
 
 	// Resolve the session_latest symlink to get the real session directory
@@ -178,6 +205,10 @@ func (r *RayLogHandler) processSessionLatestLogs() {
 			return nil
 		}
 
+		if info.IsDir() && info.Name() == markerDirectory {
+			return filepath.SkipDir
+		}
+
 		// Skip non-regular files (e.g. symlinks, directories, sockets, devices)
 		if !info.Type().IsRegular() {
 			return nil
@@ -228,20 +259,31 @@ func (r *RayLogHandler) processSessionLatestLogFile(absoluteLogPathName, session
 	logrus.Infof("Processing session_latest log file %s (object: %s)", absoluteLogPathName, objectName)
 
 	// Read the entire file content
-	content, err := os.ReadFile(absoluteLogPathName)
+	if r.managedDriver(absoluteLogPathName) {
+		if err := r.flushDriver(absoluteLogPathName); err != nil {
+			return err
+		}
+	}
+	content, err := os.Open(absoluteLogPathName)
 	if err != nil {
 		logrus.Errorf("Failed to read file %s: %v", absoluteLogPathName, err)
 		return err
 	}
 
+	defer content.Close()
+	stat, err := content.Stat()
+	if err != nil {
+		return err
+	}
+	// Freeze the snapshot length and bound memory even if the source grows.
 	// Write to storage
-	err = r.Writer.WriteFile(objectName, bytes.NewReader(content))
+	err = r.Writer.WriteFile(objectName, io.NewSectionReader(content, 0, stat.Size()))
 	if err != nil {
 		logrus.Errorf("Failed to write object %s: %v", objectName, err)
 		return err
 	}
 
-	logrus.Infof("Successfully wrote object %s, size: %d bytes", objectName, len(content))
+	logrus.Infof("Successfully wrote object %s, size: %d bytes", objectName, stat.Size())
 	return nil
 }
 
@@ -346,10 +388,17 @@ func (r *RayLogHandler) WatchPrevLogsLoops() {
 		return
 	}
 
+	retryTicker := time.NewTicker(30 * time.Second)
+	defer retryTicker.Stop()
 	logrus.Infof("Started watching prev-logs directory: %s", watchPath)
 
 	for {
 		select {
+		case <-retryTicker.C:
+			dirs, _ := filepath.Glob(filepath.Join(watchPath, "*", "*"))
+			for _, dir := range dirs {
+				r.processPrevLogsDir(dir)
+			}
 		case <-r.ShutdownChan:
 			logrus.Info("Received shutdown signal, stopping prev-logs watcher")
 			return
@@ -552,14 +601,27 @@ func (r *RayLogHandler) isFileAlreadyPersisted(absoluteLogPath, sessionID, nodeI
 	persistedPath := filepath.Join(r.persistCompleteLogsDir, sessionID, nodeID, utils.RAY_SESSIONDIR_LOGDIR_NAME, relativeLogPath)
 
 	// Check if the file exists
-	if _, err := os.Stat(persistedPath); err == nil {
-		return true
+	original, err := os.Open(absoluteLogPath)
+	if err != nil {
+		return false
 	}
-	return false
+	defer original.Close()
+	persisted, err := os.Open(persistedPath)
+	if err != nil {
+		return false
+	}
+	defer persisted.Close()
+	a, b := sha256.New(), sha256.New()
+	na, ea := io.Copy(a, original)
+	nb, eb := io.Copy(b, persisted)
+	return ea == nil && eb == nil && na == nb && string(a.Sum(nil)) == string(b.Sum(nil))
 }
 
 // processPrevLogsDir processes logs in a /tmp/ray/prev-logs/{sessionid}/{nodeid} directory
 func (r *RayLogHandler) processPrevLogsDir(sessionNodeDir string) {
+	if r.stopping.Load() {
+		return
+	}
 	// Extract session ID and node ID from the path
 	// Path format: /tmp/ray/prev-logs/{sessionid}/{nodeid}
 	parts := strings.Split(sessionNodeDir, string(filepath.Separator))
@@ -599,9 +661,18 @@ func (r *RayLogHandler) processPrevLogsDir(sessionNodeDir string) {
 
 	// Walk through the logs directory and process all files
 	err := filepath.WalkDir(logsDir, func(path string, info fs.DirEntry, err error) error {
+		if r.stopping.Load() {
+			return filepath.SkipAll
+		}
+		r.prevProcessMu.Lock()
+		defer r.prevProcessMu.Unlock()
 		if err != nil {
 			logrus.Errorf("Error walking logs path %s: %v", path, err)
 			return nil
+		}
+
+		if info.IsDir() && info.Name() == markerDirectory {
+			return filepath.SkipDir
 		}
 
 		// Skip non-regular files (e.g. symlinks, directories, sockets, devices)
@@ -610,9 +681,9 @@ func (r *RayLogHandler) processPrevLogsDir(sessionNodeDir string) {
 		}
 
 		// Check if this file has already been persisted
-		if r.isFileAlreadyPersisted(path, sessionID, nodeID) {
-			logrus.Debugf("File %s already persisted, skipping", path)
-			return nil
+		if !r.managedDriver(path) && r.isFileAlreadyPersisted(path, sessionID, nodeID) {
+			logrus.Debugf("File %s already persisted, removing verified duplicate", path)
+			return os.Remove(path)
 		}
 
 		// Process log file
@@ -627,9 +698,16 @@ func (r *RayLogHandler) processPrevLogsDir(sessionNodeDir string) {
 		return
 	}
 
+	r.prevProcessMu.Lock()
+	defer r.prevProcessMu.Unlock()
 	// After successfully processing all files, remove the node directory
 	logrus.Infof("Finished processing all logs for session: %s, node: %s. Removing node directory.", sessionID, nodeID)
-	if err := os.RemoveAll(sessionNodeDir); err != nil {
+	removeEmptyDirectories(logsDir)
+	if err := os.Remove(logsDir); err != nil && !os.IsNotExist(err) {
+		logrus.Debugf("Retaining nonempty prev-logs directory %s: %v", logsDir, err)
+		return
+	}
+	if err := os.Remove(sessionNodeDir); err != nil {
 		logrus.Errorf("Failed to remove node directory %s: %v", sessionNodeDir, err)
 	} else {
 		logrus.Infof("Successfully removed node directory: %s", sessionNodeDir)
@@ -665,20 +743,31 @@ func (r *RayLogHandler) processPrevLogFile(absoluteLogPathName, localLogDir, ses
 	logrus.Infof("Processing prev-log file %s (object: %s)", absoluteLogPathName, objectName)
 
 	// Read the entire file content
-	content, err := os.ReadFile(absoluteLogPathName)
+	if r.managedDriver(absoluteLogPathName) {
+		if err := r.flushDriver(absoluteLogPathName); err != nil {
+			return err
+		}
+	}
+	content, err := os.Open(absoluteLogPathName)
 	if err != nil {
 		logrus.Errorf("Failed to read file %s: %v", absoluteLogPathName, err)
 		return err
 	}
 
+	defer content.Close()
+	stat, err := content.Stat()
+	if err != nil {
+		return err
+	}
+	// Freeze the snapshot length and bound memory even if the source grows.
 	// Write to storage
-	err = r.Writer.WriteFile(objectName, bytes.NewReader(content))
+	err = r.Writer.WriteFile(objectName, io.NewSectionReader(content, 0, stat.Size()))
 	if err != nil {
 		logrus.Errorf("Failed to write object %s: %v", objectName, err)
 		return err
 	}
 
-	logrus.Infof("Successfully wrote object %s, size: %d bytes", objectName, len(content))
+	logrus.Infof("Successfully wrote object %s, size: %d bytes", objectName, stat.Size())
 
 	// Move the processed file to persist-complete-logs directory to avoid re-uploading
 	completeBaseDir := filepath.Join(r.persistCompleteLogsDir, sessionID, nodeID)
@@ -719,6 +808,15 @@ func (r *RayLogHandler) processPrevLogFile(absoluteLogPathName, localLogDir, ses
 		logrus.Errorf("Failed to move file from %s to %s: %v", absoluteLogPathName, targetFilePath, err)
 	} else {
 		logrus.Infof("Moved processed file from %s to %s", absoluteLogPathName, targetFilePath)
+		if r.managedDriver(absoluteLogPathName) {
+			targetMarker := driverMarkerPath(targetFilePath)
+			if err := os.MkdirAll(filepath.Dir(targetMarker), 0700); err != nil {
+				return err
+			}
+			if err := os.Rename(driverMarkerPath(absoluteLogPathName), targetMarker); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
@@ -814,7 +912,7 @@ func (r *RayLogHandler) PollActiveSessionChanges() {
 	if err == nil && currentActiveDir != "" {
 		if r.SessionDir != "" && currentActiveDir != r.SessionDir {
 			logrus.Infof("PollActiveSessionChanges: detected startup session change from %s to %s. Relocating startup session logs.", r.SessionDir, currentActiveDir)
-			if err := utils.MoveLeftoverSessionLogs(currentActiveDir, r.GetRayNodeName()); err != nil {
+			if err := r.moveLeftoverSessionLogs(currentActiveDir, r.GetRayNodeName()); err != nil {
 				logrus.Warnf("PollActiveSessionChanges: failed to relocate startup session logs: %v. Retrying on next poll tick.", err)
 				lastResolvedDir = r.SessionDir
 			} else {
@@ -845,7 +943,7 @@ func (r *RayLogHandler) PollActiveSessionChanges() {
 
 			if lastResolvedDir != "" && newResolvedDir != lastResolvedDir {
 				logrus.Infof("PollActiveSessionChanges: session changed from %s to %s. Relocating old logs.", lastResolvedDir, newResolvedDir)
-				if err := utils.MoveLeftoverSessionLogs(newResolvedDir, r.GetRayNodeName()); err != nil {
+				if err := r.moveLeftoverSessionLogs(newResolvedDir, r.GetRayNodeName()); err != nil {
 					logrus.Warnf("PollActiveSessionChanges: failed to relocate leftover session logs from %s to %s: %v. Retrying on next tick.", lastResolvedDir, newResolvedDir, err)
 					continue
 				}
@@ -858,5 +956,25 @@ func (r *RayLogHandler) PollActiveSessionChanges() {
 				}
 			}
 		}
+	}
+}
+
+func (r *RayLogHandler) moveLeftoverSessionLogs(session, node string) error {
+	r.prevProcessMu.Lock()
+	defer r.prevProcessMu.Unlock()
+	return utils.MoveLeftoverSessionLogs(session, node)
+}
+
+// Remove directories only. Failed, new or unsupported files prevent removal.
+func removeEmptyDirectories(root string) {
+	var dirs []string
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.IsDir() && p != root {
+			dirs = append(dirs, p)
+		}
+		return nil
+	})
+	for i := len(dirs) - 1; i >= 0; i-- {
+		_ = os.Remove(dirs[i])
 	}
 }

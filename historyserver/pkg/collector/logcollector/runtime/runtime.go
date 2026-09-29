@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,8 +18,9 @@ import (
 
 func NewCollector(config *types.RayCollectorConfig, writer storage.StorageWriter) RayLogCollector {
 	handler := logcollector.RayLogHandler{
-		IsHead:   config.Role == "Head",
-		LogFiles: make(chan string),
+		IsHead:               config.Role == "Head",
+		DriverArchiveEnabled: os.Getenv("RAY_DRIVER_ARCHIVE_ENABLED") == "1",
+		LogFiles:             make(chan string),
 
 		RootDir:    config.RootDir,
 		SessionDir: config.SessionDir,
